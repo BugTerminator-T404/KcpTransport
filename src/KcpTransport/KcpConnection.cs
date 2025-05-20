@@ -12,7 +12,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using static KcpTransport.LowLevel.KcpMethods;
-
+using FEC = ForwardErrorCorrection.ForwardErrorCorrection;
 namespace KcpTransport
 {
 
@@ -54,7 +54,9 @@ namespace KcpTransport
         Task? receiveEventLoopTask; // only used for client
         Thread? updateKcpWorkerThread; // only used for client
         ValueTask<FlushResult> lastFlushResult = default;
-
+        readonly FEC forwardErrorCorrection;
+        internal uint packetIndex;
+        internal List<Memory<byte>> shards;
         readonly long startingTimestamp = Stopwatch.GetTimestamp();
         readonly TimeSpan keepAliveDelay;
         CancellationTokenSource connectionCancellationTokenSource = new();
@@ -69,6 +71,8 @@ namespace KcpTransport
         // create by User(from KcpConnection.ConnectAsync), for client connection
         unsafe KcpConnection(Socket socket, uint conversationId, KcpClientConnectionOptions options)
         {
+            forwardErrorCorrection = FEC.Create(16, 16, 96);
+            shards = new List<Memory<byte>>(new Memory<byte>[16 + 16]);
             this.conversationId = conversationId;
             this.keepAliveDelay = options.KeepAliveDelay;
             this.kcp = ikcp_create(conversationId, GCHandle.ToIntPtr(GCHandle.Alloc(this)).ToPointer());
@@ -97,6 +101,8 @@ namespace KcpTransport
         // create from Listerner for server connection
         internal unsafe KcpConnection(uint conversationId, KcpListenerOptions options, SocketAddress remoteAddress)
         {
+            forwardErrorCorrection = FEC.Create(16, 16, 96);
+            shards = new List<Memory<byte>>(new Memory<byte>[16 + 16]);
             this.conversationId = conversationId;
             this.keepAliveDelay = options.KeepAliveDelay;
             this.kcp = ikcp_create(conversationId, GCHandle.ToIntPtr(GCHandle.Alloc(this)).ToPointer());
@@ -130,12 +136,12 @@ namespace KcpTransport
 
         public static ValueTask<KcpConnection> ConnectAsync(EndPoint remoteEndPoint, int streamMode = 0, CancellationToken cancellationToken = default)
         {
-            return ConnectAsync(new KcpClientConnectionOptions { RemoteEndPoint = remoteEndPoint , SteamMode = streamMode }, cancellationToken);
+            return ConnectAsync(new KcpClientConnectionOptions { RemoteEndPoint = remoteEndPoint, SteamMode = streamMode }, cancellationToken);
         }
 
         public static async ValueTask<KcpConnection> ConnectAsync(KcpClientConnectionOptions options, CancellationToken cancellationToken = default)
         {
-            var socket = new Socket(options.RemoteEndPoint?.AddressFamily?? AddressFamily.InterNetworkV6, SocketType.Dgram, ProtocolType.Udp);
+            var socket = new Socket(options.RemoteEndPoint?.AddressFamily ?? AddressFamily.InterNetworkV6, SocketType.Dgram, ProtocolType.Udp);
             socket.Blocking = false;
             options.ConfigureSocket?.Invoke(socket, options);
 
@@ -191,7 +197,7 @@ namespace KcpTransport
         async Task StartSocketEventLoopAsync(KcpClientConnectionOptions options)
         {
 #if NET8_0_OR_GREATER
-            var forceYielding = ConfigureAwaitOptions.ForceYielding; 
+            var forceYielding = ConfigureAwaitOptions.ForceYielding;
 #else
             var forceYielding = false;
 #endif
@@ -231,6 +237,10 @@ namespace KcpTransport
                         break;
                     default:
                         {
+                            if (packetType == PacketType.FECData || packetType == PacketType.FECParity)
+                            {
+                                conversationId = MemoryMarshal.Read<uint>(socketBuffer.AsSpan(10, received - 10));
+                            }
                             // Reliable
                             if (conversationId < 100)
                             {
@@ -296,7 +306,7 @@ namespace KcpTransport
             {
                 if (isDisposed) return false;
 
-                var inputResult = ikcp_input(kcp, buffer, length);
+                var inputResult = Input(kcp, buffer, length);
                 if (inputResult == 0)
                 {
                     return true;
@@ -307,6 +317,60 @@ namespace KcpTransport
                     return false;
                 }
             }
+        }
+
+        unsafe int Input(IKCPCB* kcp, byte* buffer, long length)
+        {
+            int error = 0;
+            if (forwardErrorCorrection?.isEnabled() ?? false)
+            {
+                var len = (int)length;
+                var pkt = FEC.Decode(new Span<byte>(buffer, len), len);
+                if (pkt.type == FEC.TYPE_DATA)
+                {
+                    var datas = pkt.buffer;
+                    // we have 2B size, ignore for typeData
+                    datas = datas.Slice(2);
+                    fixed (byte* ptr = datas.Span)
+                    {
+                        error = ikcp_input(kcp, ptr, datas.Length);
+                    }
+                }
+                if (pkt.type == FEC.TYPE_DATA || pkt.type == FEC.TYPE_FEC)
+                {
+                    try
+                    {
+                        var recovered = forwardErrorCorrection.Input(pkt);
+                        for (int i = 0; i < recovered.Count; i++)
+                        {
+                            var recoveredData = recovered[i];
+                            var span = recoveredData.Slice(0, 2).Span;
+                            var ptr = (void*)Unsafe.AsPointer(ref span.GetPinnableReference());
+                            ushort size = 0;
+                            Buffer.MemoryCopy(&size, ptr, 2, 2);
+                            if (size >= 2 && size <= recoveredData.Length)
+                            {
+                                recoveredData = recoveredData.Slice(size, recoveredData.Length - size);
+                                recoveredData = recoveredData.Slice(0, 2);
+                                var datas = (byte*)Unsafe.AsPointer(ref recoveredData.Span.GetPinnableReference());
+                                error = ikcp_input(kcp, datas, recoveredData.Length);
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"ex.Message {ex.Message}, {ex.StackTrace}");
+                        return -4;
+                    }
+                    return error;
+                }
+
+            }
+            else
+            {
+                error = ikcp_input(kcp, buffer, length);
+            }
+            return error;
         }
 
         internal unsafe void ConsumeKcpFragments(SocketAddress? remoteAddress, CancellationToken cancellationToken)
@@ -606,9 +670,43 @@ namespace KcpTransport
         static unsafe int KcpOutputCallback(byte* buf, int len, IKCPCB* kcp, void* user)
         {
             var self = (KcpConnection)GCHandle.FromIntPtr((IntPtr)user).Target!;
+            var sent = 0;
             var buffer = new Span<byte>(buf, len);
+            if (self.forwardErrorCorrection?.isEnabled() ?? false)
+            {
+                var bytes = new byte[len + 10];
 
-            var sent = self.socket.Send(buffer);
+                var newBffer = new Span<byte>(bytes);
+
+                buffer.CopyTo(newBffer.Slice(10));
+            
+                self.forwardErrorCorrection.MarkData(newBffer, (ushort)len);
+                sent += self.socket.Send(newBffer);
+                newBffer = newBffer.Slice(8);
+                self.shards[(int)self.packetIndex] = newBffer.ToArray();     
+                self.packetIndex++;
+                if (self.packetIndex == 16)
+                {
+                    self.forwardErrorCorrection.Encode(ref self.shards);
+               
+                    for (int i = 16; i < 32; i++)
+                    {
+                        var shardSpan = self.shards[i].Span;
+                        var sendBytes = new byte[shardSpan.Length + 8];
+                        var sendBuffer = new Span<byte>(sendBytes);
+                        shardSpan.CopyTo(sendBuffer.Slice(8));
+                        self.forwardErrorCorrection.MarkFEC(sendBuffer);
+                        sent += self.socket.Send(sendBuffer);
+                    }
+                    self.packetIndex = 0u;
+                }
+                return sent;
+            }
+            else
+            {
+                sent = self.socket.Send(buffer);
+            }
+
             return sent;
         }
 

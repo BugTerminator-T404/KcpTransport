@@ -16,6 +16,8 @@
 
         Unreliable = 71, // Unliable is 8byte header(type(4byte) + conversationId(4byte))
 
+        FECData = 80,
+        FECParity = 81
         // Reliable = 100 ~ uint.MaxValue
     }
 }

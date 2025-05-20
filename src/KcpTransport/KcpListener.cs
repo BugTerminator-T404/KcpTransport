@@ -283,6 +283,10 @@ namespace KcpTransport
                             break;
                         default:
                             {
+                                if (packetType == PacketType.FECData || packetType == PacketType.FECParity)
+                                {
+                                    conversationId = MemoryMarshal.Read<uint>(socketBuffer.AsSpan(10, received - 10));
+                                }
                                 // Reliable
                                 if (conversationId < 100)
                                 {
